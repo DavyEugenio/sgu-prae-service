@@ -6,10 +6,12 @@ import br.edu.ufape.sguPraeService.comunicacao.dto.usuario.AlunoResponse;
 import br.edu.ufape.sguPraeService.comunicacao.dto.usuario.FuncionarioResponse;
 
 import org.springframework.cloud.openfeign.FeignClient;
+import org.springframework.cloud.openfeign.SpringQueryMap;
 import org.springframework.web.bind.annotation.*;
 import br.edu.ufape.sguPraeService.config.FeignClientConfig;
 
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 
@@ -42,4 +44,7 @@ public interface AuthServiceClient {
 
     @GetMapping("/aluno")
     PageResponse<AlunoResponse> buscarAlunoPorCpf(@RequestParam("cpf") String cpf);
+
+    @GetMapping("/aluno")
+    PageResponse<AlunoResponse> buscarAlunosComFiltro(@SpringQueryMap Map<String, Object> parametros);
 }

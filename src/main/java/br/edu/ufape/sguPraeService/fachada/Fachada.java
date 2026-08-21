@@ -10,6 +10,7 @@ import java.util.stream.Collectors;
 
 import br.edu.ufape.sguPraeService.auth.AuthServiceClient;
 import br.edu.ufape.sguPraeService.comunicacao.dto.agendamento.AgendamentoRequest;
+import br.edu.ufape.sguPraeService.comunicacao.dto.usuario.AlunoPublicResponse;
 import br.edu.ufape.sguPraeService.comunicacao.dto.usuario.PageResponse;
 import br.edu.ufape.sguPraeService.comunicacao.dto.agendamento.AgendamentoResponse;
 import br.edu.ufape.sguPraeService.comunicacao.dto.beneficio.*;
@@ -268,6 +269,68 @@ public class Fachada {
                 pageable,
                 estudantes.getTotalElements()
         );
+    }
+
+    public Page<EstudanteResponse> listarEstudantesComFiltrosExternos(
+            Predicate predicate, String nome, String cpf, Long cursoId, Pageable pageable) {
+
+        BooleanBuilder filtrosPrae = new BooleanBuilder(predicate);
+
+        // 1. Há filtros do Auth Service? Se sim, buscamos a lista de UUIDs lá primeiro.
+        if (nome != null || cpf != null || cursoId != null) {
+            Map<String, Object> filtrosAuth = new HashMap<>();
+            if (nome != null) filtrosAuth.put("nome", nome);
+            if (cpf != null) filtrosAuth.put("cpf", cpf);
+            if (cursoId != null) filtrosAuth.put("curso.id", cursoId);
+
+            // Pede um tamanho grande para evitar quebrar a cláusula IN
+            filtrosAuth.put("size", 1000);
+
+            PageResponse<AlunoResponse> alunosFiltradosNoAuth;
+            try {
+                alunosFiltradosNoAuth = authServiceClient.buscarAlunosComFiltro(filtrosAuth);
+            } catch (Exception e) {
+                log.error("Erro ao buscar alunos no Auth Service com filtros: {}", filtrosAuth, e);
+                return Page.empty(pageable);
+            }
+
+            // Se a busca no Auth retornou vazio, não tem pq bater no banco do PRAE.
+            if (alunosFiltradosNoAuth == null || alunosFiltradosNoAuth.getContent() == null || alunosFiltradosNoAuth.getContent().isEmpty()) {
+                return Page.empty(pageable);
+            }
+
+            List<UUID> userIdsFiltrados = alunosFiltradosNoAuth.getContent().stream()
+                    .map(AlunoResponse::getId)
+                    .toList();
+
+            // Adiciona a restrição na query local do PRAE
+            QEstudante qEstudante = QEstudante.estudante;
+            filtrosPrae.and(qEstudante.userId.in(userIdsFiltrados));
+        }
+
+        // 2. Busca no banco do PRAE aplicando todos os filtros locais + os UUIDs encontrados
+        Page<Estudante> estudantes = estudanteService.listarEstudantes(filtrosPrae.getValue(), pageable);
+
+        if (estudantes.isEmpty()) {
+            return Page.empty(pageable);
+        }
+
+        // 3. Monta a resposta final
+        List<UUID> todosUserIds = estudantes.getContent().stream().map(Estudante::getUserId).toList();
+        List<AlunoResponse> usuariosInfo = authServiceHandler.buscarAlunos(todosUserIds);
+
+        Map<UUID, AlunoResponse> mapaAlunos = usuariosInfo.stream()
+                .collect(Collectors.toMap(AlunoResponse::getId, Function.identity()));
+
+        List<EstudanteResponse> listaEstudantes = estudantes.getContent().stream()
+                .map(estudante -> {
+                    EstudanteResponse resp = new EstudanteResponse(estudante, modelMapper);
+                    resp.setAluno(mapaAlunos.get(estudante.getUserId()));
+                    return resp;
+                })
+                .toList();
+
+        return new PageImpl<>(listaEstudantes, pageable, estudantes.getTotalElements());
     }
 
     @CircuitBreaker(name = "authServiceClient", fallbackMethod = "fallbackAtualizarEstudante")
@@ -744,6 +807,52 @@ public class Fachada {
                 .map(this::mapToBeneficioResponse);
     }
 
+    public Page<BeneficioResponse> listarBeneficiosInativosComFiltrosExternos(
+            Predicate predicate, String nome, String cpf, Long cursoId, Pageable pageable) {
+
+        BooleanBuilder filtrosPrae = new BooleanBuilder(predicate);
+
+        // 1. Há filtros cuja origem é o Auth Service?
+        if (nome != null || cpf != null || cursoId != null) {
+            Map<String, Object> filtrosAuth = new HashMap<>();
+            if (nome != null) filtrosAuth.put("nome", nome);
+            if (cpf != null) filtrosAuth.put("cpf", cpf);
+            if (cursoId != null) filtrosAuth.put("curso.id", cursoId);
+
+            // Garantimos que a cláusula IN contemple todos os resultados
+            filtrosAuth.put("size", 1000);
+
+            PageResponse<AlunoResponse> alunosFiltradosNoAuth;
+            try {
+                alunosFiltradosNoAuth = authServiceClient.buscarAlunosComFiltro(filtrosAuth);
+            } catch (Exception e) {
+                log.error("Erro ao buscar alunos no Auth Service com filtros: {}", filtrosAuth, e);
+                return Page.empty(pageable);
+            }
+
+            // Se o filtro bateu na trave, encerramos a operação
+            if (alunosFiltradosNoAuth == null || alunosFiltradosNoAuth.getContent() == null || alunosFiltradosNoAuth.getContent().isEmpty()) {
+                return Page.empty(pageable);
+            }
+
+            List<UUID> userIdsFiltrados = alunosFiltradosNoAuth.getContent().stream()
+                    .map(AlunoResponse::getId)
+                    .toList();
+
+            QBeneficio qBeneficio = QBeneficio.beneficio;
+            filtrosPrae.and(qBeneficio.estudantes.userId.in(userIdsFiltrados));
+        }
+
+        // 2. Com a lista de UUIDs anexada, aplicamos a query final no PRAE
+        Page<Beneficio> beneficios = beneficioService.listarInativos(filtrosPrae.getValue(), pageable);
+
+        if (beneficios.isEmpty()) {
+            return Page.empty(pageable);
+        }
+
+        return beneficios.map(this::mapToBeneficioResponse);
+    }
+
     public Page<Beneficio> listarBeneficiosPorTipo(Long tipoId, Pageable pageable) throws BeneficioNotFoundException {
         return beneficioService.listarPorTipo(tipoId, pageable);
     }
@@ -825,13 +934,52 @@ public class Fachada {
         return beneficioService.buscarPorPagamento(pagamentoId);
     }
 
-//    public RelatorioFinanceiroResponse gerarRelatorioFinanceiro(Predicate predicate) {
-//        // 1. Coleta os dados financeiros globais filtrados pelo PagamentoService
-//        BigDecimal totalGeralBD = pagamentoService.obterValorTotalPagamentosAtivos(predicate);
+//    public RelatorioFinanceiroResponse gerarRelatorioFinanceiro(Predicate predicate, Long cursoId) {
+//        QPagamento qPagamento = QPagamento.pagamento;
+//        BooleanBuilder builder = new BooleanBuilder();
+//        builder.and(qPagamento.ativo.isTrue());
+//
+//        if (predicate != null) {
+//            builder.and(predicate);
+//        }
+//
+//        // 1. Pegamos TODOS os UUIDs de estudantes que têm pagamento para o filtro atual
+//        List<java.util.UUID> userIdsGerais = pagamentoService.obterUserIdsEstudantesComPagamento(builder);
+//
+//        if (userIdsGerais.isEmpty()) {
+//            return construirRelatorioVazio();
+//        }
+//
+//        // 2. FILTRO POR CURSO MÁGICO (Usando a rota pública que funciona)
+//        if (cursoId != null) {
+//            // Buscamos os dados públicos (com os cursos) apenas dos alunos que têm pagamentos
+//            // Importante: use o método novo que chama o /public/batch
+//            List<br.edu.ufape.sguPraeService.comunicacao.dto.usuario.AlunoPublicResponse> alunosBatch =
+//                    authServiceHandler.buscarAlunosPublicos(userIdsGerais);
+//
+//            // Filtramos na memória para reter apenas os UUIDs de quem é do curso pesquisado
+//            List<java.util.UUID> userIdsDoCurso = alunosBatch.stream()
+//                    .filter(a -> a.getCurso() != null && a.getCurso().getId().equals(cursoId))
+//                    .map(br.edu.ufape.sguPraeService.comunicacao.dto.usuario.AlunoPublicResponse::getId)
+//                    .toList();
+//
+//            // Se, após o filtro, não sobrar ninguém, retornamos zerado
+//            if (userIdsDoCurso.isEmpty()) {
+//                return construirRelatorioVazio();
+//            }
+//
+//            // Injetamos a trava no banco: some apenas os pagamentos DESTES alunos
+//            builder.and(qPagamento.beneficio.estudantes.userId.in(userIdsDoCurso));
+//
+//            // Atualizamos a lista de ativos para a contagem final
+//            userIdsGerais = userIdsDoCurso;
+//        }
+//
+//        // 3. Calcula Totais Financeiros com o builder já restringido (se tiver curso)
+//        BigDecimal totalGeralBD = pagamentoService.obterValorTotalPagamentosAtivos(builder);
 //        Double totalGeral = (totalGeralBD != null) ? totalGeralBD.doubleValue() : 0.0;
 //
-//        // 2. Coleta a divisão de valores por Tipo de Benefício
-//        List<Object[]> dadosPorTipo = pagamentoService.obterValorTotalPorTipoBeneficio(predicate);
+//        List<Object[]> dadosPorTipo = pagamentoService.obterValorTotalPorTipoBeneficio(builder);
 //        List<RelatorioFinanceiroResponse.ValorPorTipoDTO> valorPorTipo = dadosPorTipo.stream()
 //                .map(obj -> new RelatorioFinanceiroResponse.ValorPorTipoDTO(
 //                        (Long) obj[0],
@@ -839,11 +987,9 @@ public class Fachada {
 //                        ((BigDecimal) obj[2]).doubleValue()
 //                )).toList();
 //
-//        // 3. Obter os estudantes ÚNICOS atrelados aos pagamentos que passaram no filtro
-//        List<java.util.UUID> userIdsAtivos = pagamentoService.obterUserIdsEstudantesComPagamento(predicate);
-//
-//        // 4. Delegar ao BeneficioService o agrupamento de Cursos usando a lista de alunos exata
-//        List<java.util.Map<String, Object>> dadosCursos = beneficioService.obterQuantidadeBeneficiadosPorCurso(userIdsAtivos);
+//        // 4. Distribuição por Cursos
+//        // Já temos a lista de UUIDs certinha, passamos pro serviço agrupar
+//        List<java.util.Map<String, Object>> dadosCursos = beneficioService.obterQuantidadeBeneficiadosPorCurso(userIdsGerais);
 //
 //        List<RelatorioFinanceiroResponse.BeneficiadosPorCursoDTO> beneficiadosPorCurso = dadosCursos.stream()
 //                .map(map -> new RelatorioFinanceiroResponse.BeneficiadosPorCursoDTO(
@@ -852,10 +998,9 @@ public class Fachada {
 //                        (Long) map.get("quantidadeBeneficiados")
 //                )).toList();
 //
-//        // 5. Constrói o objeto final
 //        return RelatorioFinanceiroResponse.builder()
 //                .totalGeral(totalGeral)
-//                .quantidadePessoasAtendidas(userIdsAtivos.size()) // Usamos o tamanho da lista filtrada
+//                .quantidadePessoasAtendidas(userIdsGerais.size())
 //                .quantidadeTiposBeneficio(valorPorTipo.size())
 //                .quantidadeCursosDistintos(beneficiadosPorCurso.size())
 //                .valorTotalPorTipoBeneficio(valorPorTipo)
@@ -863,48 +1008,64 @@ public class Fachada {
 //                .build();
 //    }
 
+    private RelatorioFinanceiroResponse construirRelatorioVazio() {
+        return RelatorioFinanceiroResponse.builder()
+                .totalGeral(0.0)
+                .quantidadePessoasAtendidas(0)
+                .quantidadeTiposBeneficio(0)
+                .quantidadeCursosDistintos(0)
+                .valorTotalPorTipoBeneficio(new java.util.ArrayList<>())
+                .quantidadeBeneficiadosPorCurso(new java.util.ArrayList<>())
+                .build();
+    }
+
     public RelatorioFinanceiroResponse gerarRelatorioFinanceiro(Predicate predicate, Long cursoId) {
         QPagamento qPagamento = QPagamento.pagamento;
         BooleanBuilder builder = new BooleanBuilder();
         builder.and(qPagamento.ativo.isTrue());
 
+        // Anexa os filtros locais de data/lote/etc
         if (predicate != null) {
             builder.and(predicate);
         }
 
-        // 1. Pegamos TODOS os UUIDs de estudantes que têm pagamento para o filtro atual
-        List<java.util.UUID> userIdsGerais = pagamentoService.obterUserIdsEstudantesComPagamento(builder);
-
+        // 1. Coletar alunos que possuem pagamento neste filtro inicial
+        List<UUID> userIdsGerais = pagamentoService.obterUserIdsEstudantesComPagamento(builder);
         if (userIdsGerais.isEmpty()) {
             return construirRelatorioVazio();
         }
 
-        // 2. FILTRO POR CURSO MÁGICO (Usando a rota pública que funciona)
+        // 2. Se houver filtro de curso, cruzar com a rota PÚBLICA do Auth Service
         if (cursoId != null) {
-            // Buscamos os dados públicos (com os cursos) apenas dos alunos que têm pagamentos
-            // Importante: use o método novo que chama o /public/batch
-            List<br.edu.ufape.sguPraeService.comunicacao.dto.usuario.AlunoPublicResponse> alunosBatch =
-                    authServiceHandler.buscarAlunosPublicos(userIdsGerais);
+            List<AlunoPublicResponse> alunosBatch;
+            try {
+                // Rota segura que não exige token de administrador
+                alunosBatch = authServiceHandler.buscarAlunosPublicos(userIdsGerais);
+            } catch (Exception e) {
+                log.error("Erro ao solicitar alunos públicos no Auth", e);
+                return construirRelatorioVazio();
+            }
 
-            // Filtramos na memória para reter apenas os UUIDs de quem é do curso pesquisado
-            List<java.util.UUID> userIdsDoCurso = alunosBatch.stream()
-                    .filter(a -> a.getCurso() != null && a.getCurso().getId().equals(cursoId))
-                    .map(br.edu.ufape.sguPraeService.comunicacao.dto.usuario.AlunoPublicResponse::getId)
+            if (alunosBatch == null || alunosBatch.isEmpty()) {
+                return construirRelatorioVazio();
+            }
+
+            // Filtrar com longValue() para evitar problemas de cast do Jackson
+            List<UUID> userIdsDoCurso = alunosBatch.stream()
+                    .filter(a -> a.getCurso() != null && a.getCurso().getId().longValue() == cursoId.longValue())
+                    .map(AlunoPublicResponse::getId)
                     .toList();
 
-            // Se, após o filtro, não sobrar ninguém, retornamos zerado
             if (userIdsDoCurso.isEmpty()) {
                 return construirRelatorioVazio();
             }
 
-            // Injetamos a trava no banco: some apenas os pagamentos DESTES alunos
+            // Restringe o construtor de queries do PRAE
             builder.and(qPagamento.beneficio.estudantes.userId.in(userIdsDoCurso));
-
-            // Atualizamos a lista de ativos para a contagem final
-            userIdsGerais = userIdsDoCurso;
+            userIdsGerais = userIdsDoCurso; // Atualiza a lista base para as contagens abaixo
         }
 
-        // 3. Calcula Totais Financeiros com o builder já restringido (se tiver curso)
+        // 3. Cálculos Financeiros
         BigDecimal totalGeralBD = pagamentoService.obterValorTotalPagamentosAtivos(builder);
         Double totalGeral = (totalGeralBD != null) ? totalGeralBD.doubleValue() : 0.0;
 
@@ -916,10 +1077,7 @@ public class Fachada {
                         ((BigDecimal) obj[2]).doubleValue()
                 )).toList();
 
-        // 4. Distribuição por Cursos
-        // Já temos a lista de UUIDs certinha, passamos pro serviço agrupar
-        List<java.util.Map<String, Object>> dadosCursos = beneficioService.obterQuantidadeBeneficiadosPorCurso(userIdsGerais);
-
+        List<Map<String, Object>> dadosCursos = beneficioService.obterQuantidadeBeneficiadosPorCurso(userIdsGerais);
         List<RelatorioFinanceiroResponse.BeneficiadosPorCursoDTO> beneficiadosPorCurso = dadosCursos.stream()
                 .map(map -> new RelatorioFinanceiroResponse.BeneficiadosPorCursoDTO(
                         (Long) map.get("cursoId"),
@@ -934,18 +1092,6 @@ public class Fachada {
                 .quantidadeCursosDistintos(beneficiadosPorCurso.size())
                 .valorTotalPorTipoBeneficio(valorPorTipo)
                 .quantidadeBeneficiadosPorCurso(beneficiadosPorCurso)
-                .build();
-    }
-
-    // Método auxiliar apenas para deixar o código limpo e evitar repetição
-    private RelatorioFinanceiroResponse construirRelatorioVazio() {
-        return RelatorioFinanceiroResponse.builder()
-                .totalGeral(0.0)
-                .quantidadePessoasAtendidas(0)
-                .quantidadeTiposBeneficio(0)
-                .quantidadeCursosDistintos(0)
-                .valorTotalPorTipoBeneficio(new java.util.ArrayList<>())
-                .quantidadeBeneficiadosPorCurso(new java.util.ArrayList<>())
                 .build();
     }
 

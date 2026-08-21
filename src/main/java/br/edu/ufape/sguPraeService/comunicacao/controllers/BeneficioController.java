@@ -48,10 +48,13 @@ public class BeneficioController {
     @GetMapping("/inativos")
     public ResponseEntity<Page<BeneficioResponse>> listarInativos(
             @QuerydslPredicate(root = Beneficio.class) Predicate predicate,
+            @RequestParam(required = false) String nome,
+            @RequestParam(required = false) String cpf,
+            @RequestParam(required = false, name = "curso.id") Long cursoId,
             @PageableDefault(sort = "id") Pageable pageable) {
 
-
-        return ResponseEntity.ok(fachada.listarBeneficiosInativos(predicate, pageable));
+        Page<BeneficioResponse> page = fachada.listarBeneficiosInativosComFiltrosExternos(predicate, nome, cpf, cursoId, pageable);
+        return ResponseEntity.ok(page);
     }
 
     @GetMapping("/estudante/{estudanteId}")
@@ -148,7 +151,7 @@ public class BeneficioController {
 @GetMapping("/relatorio/financeiro")
 public ResponseEntity<RelatorioFinanceiroResponse> gerarRelatorioFinanceiro(
         @QuerydslPredicate(root = Pagamento.class) Predicate predicate,
-        @RequestParam(required = false) Long cursoId) {
+        @RequestParam(required = false, name = "curso.id") Long cursoId) {
 
     RelatorioFinanceiroResponse relatorio = fachada.gerarRelatorioFinanceiro(predicate, cursoId);
     return ResponseEntity.ok(relatorio);
