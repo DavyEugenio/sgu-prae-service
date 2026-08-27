@@ -36,8 +36,12 @@ public class EstudanteController {
     @GetMapping
     public Page<EstudanteResponse> listarEstudantes(
             @QuerydslPredicate(root = Estudante.class) Predicate predicate,
+            @RequestParam(required = false) String nome,
+            @RequestParam(required = false) String cpf,
+            @RequestParam(required = false, name = "curso.id") Long cursoId,
             @PageableDefault(sort = "id") Pageable pageable) {
-        return fachada.listarEstudantes(predicate, pageable);
+
+        return fachada.listarEstudantesComFiltrosExternos(predicate, nome, cpf, cursoId, pageable);
     }
 
     @GetMapping("/curso/{id}")
