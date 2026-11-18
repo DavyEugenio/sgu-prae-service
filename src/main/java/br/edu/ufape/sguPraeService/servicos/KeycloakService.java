@@ -2,6 +2,8 @@ package br.edu.ufape.sguPraeService.servicos;
 
 import br.edu.ufape.sguPraeService.comunicacao.dto.auth.TokenResponse;
 import br.edu.ufape.sguPraeService.exceptions.auth.KeycloakAuthenticationException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PostConstruct;
 import jakarta.ws.rs.NotFoundException;
 import jakarta.ws.rs.core.Response;
@@ -32,6 +34,8 @@ import java.util.stream.Collectors;
 @Service
 @RequiredArgsConstructor
 public class KeycloakService implements br.edu.ufape.sguPraeService.servicos.interfaces.KeycloakService {
+
+    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
     private Keycloak keycloak;
 
@@ -65,7 +69,7 @@ public class KeycloakService implements br.edu.ufape.sguPraeService.servicos.int
     @Override
     public TokenResponse login(String email, String password) throws KeycloakAuthenticationException {
         String tokenUrl = keycloakServerUrl + "/realms/" + realm + "/protocol/openid-connect/token";
-        RestTemplate restTemplate = new RestTemplate();
+        RestTemplate restTemplate = createRestTemplate();
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_FORM_URLENCODED);
 
@@ -87,19 +91,60 @@ public class KeycloakService implements br.edu.ufape.sguPraeService.servicos.int
                 return tokenResponse;
             }
         } catch (HttpStatusCodeException e) {
-            if (e.getStatusCode() == HttpStatus.BAD_REQUEST && !verifyEmailValid(email)) {
-                throw new KeycloakAuthenticationException("E-mail não verificado. Verifique sua caixa de entrada.");
-            }
-            if (e.getStatusCode() == HttpStatus.UNAUTHORIZED) {
-                throw new KeycloakAuthenticationException("Credenciais inválidas. Verifique o email e a senha.");
-            }
-            throw new KeycloakAuthenticationException("Erro ao autenticar no Keycloak: " + e.getStatusCode(), e);
+            throw mapHttpLoginException(e, email);
         } catch (ResourceAccessException e) {
             throw new KeycloakAuthenticationException("Não foi possível acessar o servidor Keycloak. Verifique sua conexão.", e);
         } catch (Exception e) {
             throw new KeycloakAuthenticationException("Erro inesperado durante o login.", e);
         }
         throw new KeycloakAuthenticationException("Erro ao autenticar: resposta inesperada do servidor.");
+    }
+
+    protected RestTemplate createRestTemplate() {
+        return new RestTemplate();
+    }
+
+    private KeycloakAuthenticationException mapHttpLoginException(HttpStatusCodeException e, String loginIdentifier) {
+        JsonNode errorJson = parseKeycloakError(e);
+        String errorCode = errorJson != null ? errorJson.path("error").asText("") : "";
+        String errorDescription = errorJson != null ? errorJson.path("error_description").asText("") : "";
+
+        log.warn("Falha na autenticação Keycloak (status={}, error={}, description={})",
+                e.getStatusCode().value(), errorCode, errorDescription);
+
+        if (e.getStatusCode() == HttpStatus.UNAUTHORIZED || "Invalid user credentials".equalsIgnoreCase(errorDescription)) {
+            return new KeycloakAuthenticationException("Credenciais inválidas. Verifique o email e a senha.");
+        }
+
+        if (e.getStatusCode() == HttpStatus.BAD_REQUEST) {
+            if (!verifyEmailValid(loginIdentifier)) {
+                return new KeycloakAuthenticationException("E-mail não verificado. Verifique sua caixa de entrada.");
+            }
+            if (errorDescription.contains("Account is not fully set up")) {
+                return new KeycloakAuthenticationException(
+                        "Conta pendente de configuração no Keycloak (verifique ações pendentes como senha temporária, atualização de perfil ou verificação de e-mail).", e);
+            }
+            if (errorDescription.contains("Account disabled")) {
+                return new KeycloakAuthenticationException("Conta desativada no servidor de autenticação.", e);
+            }
+            if (!errorDescription.isBlank()) {
+                return new KeycloakAuthenticationException("Erro ao autenticar no Keycloak (" + e.getStatusCode() + "): " + errorDescription, e);
+            }
+        }
+
+        return new KeycloakAuthenticationException("Erro ao autenticar no Keycloak: " + e.getStatusCode(), e);
+    }
+
+    private JsonNode parseKeycloakError(HttpStatusCodeException e) {
+        try {
+            String body = e.getResponseBodyAsString();
+            if (body != null && !body.isBlank()) {
+                return OBJECT_MAPPER.readTree(body);
+            }
+        } catch (Exception ignored) {
+            // Resposta não-JSON do Keycloak: mantém fallback seguro por status HTTP
+        }
+        return null;
     }
 
     @Override
@@ -265,10 +310,14 @@ public class KeycloakService implements br.edu.ufape.sguPraeService.servicos.int
                 .collect(Collectors.toList());
     }
 
-    private boolean verifyEmailValid(String email) {
-        List<UserRepresentation> users = keycloak.realm(realm).users().searchByEmail(email, true);
+    private boolean verifyEmailValid(String loginIdentifier) {
+        List<UserRepresentation> users = keycloak.realm(realm).users().searchByEmail(loginIdentifier, true);
+        if (users == null || users.isEmpty()) {
+            users = keycloak.realm(realm).users().search(loginIdentifier, true);
+        }
         Optional<UserRepresentation> userOptional = users.stream()
-                .filter(user -> email.equalsIgnoreCase(user.getEmail()))
+                .filter(user -> loginIdentifier.equalsIgnoreCase(user.getEmail())
+                        || loginIdentifier.equalsIgnoreCase(user.getUsername()))
                 .findFirst();
         return userOptional.map(UserRepresentation::isEmailVerified).orElse(true);
     }
