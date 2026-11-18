@@ -297,4 +297,138 @@ class SecurityAndAuthInfrastructureTest {
         org.mockito.Mockito.verify(mockClientResource).update(clientRep);
         org.mockito.Mockito.verify(keycloakService).init();
     }
+
+    @Test
+    @DisplayName("KeycloakDevEnvironmentSynchronizer: Deve criar admin bootstrap e ajustar sslRequired=none quando ausente em dev/docker")
+    void deveCriarAdminBootstrapEAjustarSslNoAmbienteLocal() {
+        br.edu.ufape.sguPraeService.servicos.interfaces.KeycloakService keycloakService =
+                mock(br.edu.ufape.sguPraeService.servicos.interfaces.KeycloakService.class);
+        org.keycloak.admin.client.Keycloak mockAdminKeycloak =
+                mock(org.keycloak.admin.client.Keycloak.class, org.mockito.Answers.RETURNS_DEEP_STUBS);
+
+        org.keycloak.representations.idm.RealmRepresentation realmRep =
+                new org.keycloak.representations.idm.RealmRepresentation();
+        realmRep.setSslRequired("external");
+        org.mockito.Mockito.when(mockAdminKeycloak.realm("sgu-ufape").toRepresentation()).thenReturn(realmRep);
+
+        org.mockito.Mockito.when(mockAdminKeycloak.realm("sgu-ufape").clients().findByClientId("sgu-application"))
+                .thenReturn(List.of());
+        org.mockito.Mockito.when(mockAdminKeycloak.realm("sgu-ufape").roles().get("administrador").getUserMembers(0, 1))
+                .thenReturn(List.of());
+        org.mockito.Mockito.when(mockAdminKeycloak.realm("sgu-ufape").users().searchByEmail("admin@ufape.edu.br", true))
+                .thenReturn(List.of());
+
+        jakarta.ws.rs.core.Response createdResponse = mock(jakarta.ws.rs.core.Response.class);
+        org.mockito.Mockito.when(createdResponse.getStatus()).thenReturn(201);
+        org.mockito.Mockito.when(createdResponse.getStatusInfo()).thenReturn(jakarta.ws.rs.core.Response.Status.CREATED);
+        org.mockito.Mockito.when(createdResponse.getLocation())
+                .thenReturn(java.net.URI.create("http://localhost:9090/admin/realms/sgu-ufape/users/11111111-1111-1111-1111-111111111111"));
+        org.mockito.Mockito.when(mockAdminKeycloak.realm("sgu-ufape").users().create(org.mockito.ArgumentMatchers.any()))
+                .thenReturn(createdResponse);
+
+        org.keycloak.representations.idm.RoleRepresentation adminRole =
+                new org.keycloak.representations.idm.RoleRepresentation();
+        adminRole.setName("administrador");
+        org.mockito.Mockito.when(mockAdminKeycloak.realm("sgu-ufape").roles().get("administrador").toRepresentation())
+                .thenReturn(adminRole);
+
+        br.edu.ufape.sguPraeService.config.KeycloakDevEnvironmentSynchronizer synchronizer =
+                new br.edu.ufape.sguPraeService.config.KeycloakDevEnvironmentSynchronizer(keycloakService) {
+                    @Override
+                    protected org.keycloak.admin.client.Keycloak createAdminClient() {
+                        return mockAdminKeycloak;
+                    }
+                };
+
+        ReflectionTestUtils.setField(synchronizer, "realm", "sgu-ufape");
+        ReflectionTestUtils.setField(synchronizer, "clientId", "sgu-application");
+        ReflectionTestUtils.setField(synchronizer, "expectedClientSecret", "sgu-prae-local-dev-secret");
+        ReflectionTestUtils.setField(synchronizer, "devAdminEnabled", true);
+        ReflectionTestUtils.setField(synchronizer, "devAdminEmail", "admin@ufape.edu.br");
+        ReflectionTestUtils.setField(synchronizer, "devAdminPassword", "Admin@123");
+
+        synchronizer.run(new DefaultApplicationArguments());
+
+        assertEquals("none", realmRep.getSslRequired());
+        org.mockito.Mockito.verify(mockAdminKeycloak.realm("sgu-ufape")).update(realmRep);
+
+        org.mockito.ArgumentCaptor<org.keycloak.representations.idm.UserRepresentation> userCaptor =
+                org.mockito.ArgumentCaptor.forClass(org.keycloak.representations.idm.UserRepresentation.class);
+        org.mockito.Mockito.verify(mockAdminKeycloak.realm("sgu-ufape").users()).create(userCaptor.capture());
+
+        org.keycloak.representations.idm.UserRepresentation createdUser = userCaptor.getValue();
+        assertEquals("admin@ufape.edu.br", createdUser.getEmail());
+        assertTrue(createdUser.isEnabled());
+        assertTrue(createdUser.isEmailVerified());
+        assertFalse(createdUser.getCredentials().getFirst().isTemporary());
+        org.mockito.Mockito.verify(mockAdminKeycloak.realm("sgu-ufape").users()
+                .get("11111111-1111-1111-1111-111111111111").roles().realmLevel()).add(List.of(adminRole));
+    }
+
+    @Test
+    @DisplayName("KeycloakService: Deve detalhar erro 400 (Account is not fully set up / email não verificado por username)")
+    void deveDetalharErrosDeAutenticacao400DoKeycloak() {
+        org.springframework.web.client.RestTemplate mockRestTemplate = mock(org.springframework.web.client.RestTemplate.class);
+        org.keycloak.admin.client.Keycloak mockKeycloakAdmin =
+                mock(org.keycloak.admin.client.Keycloak.class, org.mockito.Answers.RETURNS_DEEP_STUBS);
+
+        br.edu.ufape.sguPraeService.servicos.KeycloakService service =
+                new br.edu.ufape.sguPraeService.servicos.KeycloakService() {
+                    @Override
+                    protected org.springframework.web.client.RestTemplate createRestTemplate() {
+                        return mockRestTemplate;
+                    }
+                };
+
+        ReflectionTestUtils.setField(service, "keycloak", mockKeycloakAdmin);
+        ReflectionTestUtils.setField(service, "realm", "sgu-ufape");
+        ReflectionTestUtils.setField(service, "keycloakServerUrl", "http://localhost:9090");
+        ReflectionTestUtils.setField(service, "clientId", "sgu-application");
+        ReflectionTestUtils.setField(service, "clientSecret", "sgu-prae-local-dev-secret");
+
+        // Cenário 1: Usuário criado no Keycloak com senha temporária ou perfil incompleto ('Account is not fully set up')
+        org.keycloak.representations.idm.UserRepresentation verifiedUser =
+                new org.keycloak.representations.idm.UserRepresentation();
+        verifiedUser.setEmail("admin@ufape.edu.br");
+        verifiedUser.setEmailVerified(true);
+        org.mockito.Mockito.when(mockKeycloakAdmin.realm("sgu-ufape").users().searchByEmail("admin@ufape.edu.br", true))
+                .thenReturn(List.of(verifiedUser));
+
+        org.springframework.web.client.HttpClientErrorException badReqSetup =
+                org.springframework.web.client.HttpClientErrorException.create(
+                        org.springframework.http.HttpStatus.BAD_REQUEST,
+                        "Bad Request",
+                        org.springframework.http.HttpHeaders.EMPTY,
+                        "{\"error\":\"invalid_grant\",\"error_description\":\"Account is not fully set up\"}".getBytes(StandardCharsets.UTF_8),
+                        StandardCharsets.UTF_8);
+
+        org.mockito.Mockito.when(mockRestTemplate.exchange(
+                org.mockito.ArgumentMatchers.anyString(),
+                org.mockito.ArgumentMatchers.eq(org.springframework.http.HttpMethod.POST),
+                org.mockito.ArgumentMatchers.any(),
+                org.mockito.ArgumentMatchers.eq(br.edu.ufape.sguPraeService.comunicacao.dto.auth.TokenResponse.class)))
+                .thenThrow(badReqSetup);
+
+        br.edu.ufape.sguPraeService.exceptions.auth.KeycloakAuthenticationException ex1 = assertThrows(
+                br.edu.ufape.sguPraeService.exceptions.auth.KeycloakAuthenticationException.class,
+                () -> service.login("admin@ufape.edu.br", "Admin@123"));
+        assertTrue(ex1.getMessage().contains("Conta pendente de configuração no Keycloak"));
+
+        // Cenário 2: Tentativa de login por username com e-mail não verificado deve ser detectada pelo fallback
+        org.keycloak.representations.idm.UserRepresentation unverifiedByUsername =
+                new org.keycloak.representations.idm.UserRepresentation();
+        unverifiedByUsername.setUsername("admin");
+        unverifiedByUsername.setEmail("admin-novo@ufape.edu.br");
+        unverifiedByUsername.setEmailVerified(false);
+
+        org.mockito.Mockito.when(mockKeycloakAdmin.realm("sgu-ufape").users().searchByEmail("admin", true))
+                .thenReturn(List.of());
+        org.mockito.Mockito.when(mockKeycloakAdmin.realm("sgu-ufape").users().search("admin", true))
+                .thenReturn(List.of(unverifiedByUsername));
+
+        br.edu.ufape.sguPraeService.exceptions.auth.KeycloakAuthenticationException ex2 = assertThrows(
+                br.edu.ufape.sguPraeService.exceptions.auth.KeycloakAuthenticationException.class,
+                () -> service.login("admin", "Admin@123"));
+        assertEquals("E-mail não verificado. Verifique sua caixa de entrada.", ex2.getMessage());
+    }
 }
